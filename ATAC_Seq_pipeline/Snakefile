@@ -1,0 +1,706 @@
+# Snakemake simplified ATAC-Seq pipeline
+# Based on initial pipelines from Diego Calderon, Evan Boyle, Nasa Sinnott-Armstrong 
+
+import os, sys, glob
+import pandas as pd
+
+sample_sheet = pd.read_table('ATAC_samplesheet.txt', index_col = False)
+atac_samples = sample_sheet.Name.tolist()
+
+# Refence files from SnakeATAC pipeline
+BOWTIE2_INDEX = '/oak/stanford/groups/pritch/users/jake/genome/human/bowtie2/GRCh38' 
+EFFECTIVE_GENOME_SIZE = 2701495761 # GRCh38: 50bp # http://deeptools.readthedocs.io/en/latest/content/feature/effectiveGenomeSize.html
+CHROM_SIZES = '/oak/stanford/groups/pritch/users/jake/genome/human/GRCh38.sizes.genome'
+BLACKLIST = '/oak/stanford/groups/pritch/users/jake/genome/human/blacklist/ENCFF356LFX.bed' # Download from encode
+
+################################################################################################################
+# things break if you don't have the error file output folder so we make it here
+os.system('mkdir -p error_files; ')
+##################################################################################################################
+
+rule all:
+    input:
+       expand("output/peaks/{sample_label}_{suffix}", \
+            sample_label = atac_samples, \
+            suffix = ['peaks.narrowPeak', 'peaks.xls', 'summits.bed']),
+        "output/multiqc/multiqc_report.html",
+        expand("output/coverage/{sample_label}_pileup.bw", sample_label = atac_samples),
+        "output/pooled/coverage/pooled_pileup.bw",
+        "output/counts/count_mat_peaks_cluster150bp_peak_size_350bp.txt",
+        "output/merged_peaks/plots/best_combo.pdf",
+        "output/merged_peaks/best_combo.tsv",
+        expand("output/il2ra_insertion_beds/{sample_label}_il2ra_insertions.bed", sample_label = atac_samples),
+        expand("output/regions_of_interest/gata3/{sample_label}_gata3_insertions.bed", sample_label = atac_samples),
+        expand("output/regions_of_interest/ets1/{sample_label}_ets1_insertions.bed", sample_label = atac_samples),
+        expand("output/regions_of_interest/rs1465697/{sample_label}_rs1465697_insertions.bed", sample_label = atac_samples),
+        expand("output/regions_of_interest/rs1323292/{sample_label}_rs1323292_insertions.bed", sample_label = atac_samples)
+
+#######################################################################################################################
+# Processing pipeline
+
+# Trim adapters
+rule trim_adapters_cutadapt:
+    input:
+        R1 = lambda wildcards: glob.glob('original_fastq/*/' + wildcards.sample_label + '*R1*.fastq.gz'),
+        R2 = lambda wildcards: glob.glob('original_fastq/*/' + wildcards.sample_label + '*R2*.fastq.gz')
+    output:
+        R1_temp = "output/fastqs/temp/{sample_label}_R1_merged.fastq",
+        R2_temp = "output/fastqs/temp/{sample_label}_R2_merged.fastq",
+        R1 = "output/fastqs/trimmed/{sample_label}_R1_trimmed.fastq.gz",
+        R2 = "output/fastqs/trimmed/{sample_label}_R2_trimmed.fastq.gz",
+    params:
+        error_out_file = "error_files/{sample_label}_trim",
+        run_time="10:00:00",
+        cores="1",
+        memory="6000",
+        job_name="trimming"
+    benchmark: "benchmarks/trimming/{sample_label}.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "zcat {input.R1} > {output.R1_temp}; "
+        "zcat {input.R2} > {output.R2_temp}; "
+        "cutadapt -a Trans2_rc=CTGTCTCTTATACACATCTCCGAGCCCACGAGAC "
+        "-A Trans1_rc=CTGTCTCTTATACACATCTGACGCTGCCGACGA "
+        "--minimum-length 20 "
+        "-o {output.R1} "
+        "--paired-output {output.R2} {output.R1_temp} {output.R2_temp}"
+
+# Map reads
+# -X 2000 maps paired reads separated up to 2000 bases apart
+# --very-sensitive results in better mapping
+rule run_bowtie:
+    input:
+        idx = BOWTIE2_INDEX + ".1.bt2",
+        R1 = "output/fastqs/trimmed/{sample_label}_R1_trimmed.fastq.gz",
+        R2 ="output/fastqs/trimmed/{sample_label}_R2_trimmed.fastq.gz",
+    output:
+        bam = "output/bams/unprocessed/{sample_label}.bam",
+        idx = "output/bams/unprocessed/{sample_label}.bam.bai"
+    params:
+        error_out_file = "error_files/{sample_label}_bowtie",
+        run_time = "10:00:00",
+        cores = "8",
+        memory = "12000",
+        job_name = "bwt2"
+    benchmark: "benchmarks/bowtie/{sample_label}.txt"
+    threads: 8
+    conda:
+        "envs/atac_seq.yaml"
+    shell: 
+        "bowtie2 -X 2000 "
+        "--threads {threads} "
+        "--very-sensitive "
+        "-x " + BOWTIE2_INDEX + " -1 {input.R1} -2 {input.R2} "
+        "| samtools sort -@ {threads} -o output/bams/unprocessed/{wildcards.sample_label}.bam -; "
+        "samtools index -@ {threads} output/bams/unprocessed/{wildcards.sample_label}.bam "
+
+# Filter out low quality reads
+# -F 1804 exclude:
+#   read unmapped (0x4),
+#   mate unmapped (0x8)*
+#   not primary alignment (0x100)
+#   read fails platform/vendor quality checks (0x200)
+#   read is PCR or optical duplicate (0x400)
+# -f 2 require that read mapped in proper pair (0x2)*
+# -q require that reads exceed this mapq score
+# Filter out reads mapping to encode blacklist regions
+
+rule rm_low_quality_reads:
+    input: 
+        bam = rules.run_bowtie.output.bam,
+        idx = rules.run_bowtie.output.idx
+    output: 
+        bam = "output/bams/filtered/{sample_label}.filtered.bam",
+        idx = "output/bams/filtered/{sample_label}.filtered.bam.bai"
+    params:
+        error_out_file="error_files/{sample_label}_filter_bams",
+        run_time="01:00:00",
+        cores="1",
+        memory="8000",
+        job_name="filter_bams",
+    benchmark: "benchmarks/filter/rm_low_quality_reads_{sample_label}.txt"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "samtools view -h -b -F 1804 -f 2 -q 30 {input.bam} |  "
+        "bedtools intersect -v -abam stdin -b " + BLACKLIST + " > {output.bam}; "
+        "samtools index {output.bam}"
+
+# Remove duplicate reads
+rule rm_duplicates_picard: 
+    input:
+        bam = rules.rm_low_quality_reads.output.bam,
+        idx = rules.rm_low_quality_reads.output.idx
+    output:
+        bam = "output/bams/deduped/{sample_label}.filtered.deduped.bam",
+        idx = "output/bams/deduped/{sample_label}.filtered.deduped.bam.bai",
+        raw_metrics = "output/qc/picard_stats/picard_dedup_metrics_{sample_label}.txt"
+    params:
+        error_out_file =  "error_files/{sample_label}_picard_rmdup",
+        run_time="01:00:00",
+        cores="1",
+        memory="40000",
+        job_name="picard_rm_duplicate_reads"
+    benchmark: "benchmarks/picard_MarkDuplicates/{sample_label}.txt"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "picard MarkDuplicates "
+        "INPUT={input.bam} "
+        "OUTPUT={output.bam} "
+        "METRICS_FILE={output.raw_metrics} "
+        "REMOVE_DUPLICATES=true "
+        "VALIDATION_STRINGENCY=LENIENT; "
+        "samtools index {output.bam}; "
+
+# Filter out reads mapping to ChrX, ChrY, ChrM
+rule rm_chrMXY:
+    input:
+        bam = rules.rm_duplicates_picard.output.bam,
+        idx = rules.rm_duplicates_picard.output.idx
+    output:
+        bam = "output/bams/noChrMXY/{sample_label}.filtered.dedup.noChrMXY.bam",
+        idx = "output/bams/noChrMXY/{sample_label}.filtered.dedup.noChrMXY.bam.bai"
+    params:
+        error_out_file = "error_files/{sample_label}_rm_chrMXY",
+        run_time = "00:30:00",
+        cores = "1",
+        memory = "4000",
+        job_name = "rm_chrMXY_reads"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "samtools view -h {input.bam} | "
+        "grep -v -e chrM -e chrX -e chrY | "
+        "samtools sort -o {output.bam}; "
+        "samtools index {output.bam}"
+
+# Make bedfile of specific ATAC insertion site
+# shift reads to account for Tn5 insertion profile
+# shift + strand reads +4 nucleotides and 
+# - strand reads -5 nucleotides
+# only print 5' most base of the read
+rule make_insertion_bed:
+    input:
+        bam = rules.rm_chrMXY.output.bam,
+        idx = rules.rm_chrMXY.output.idx
+    output:
+        bed = "output/beds/{sample_label}.insertions.bed"
+    params:
+        error_out_file="error_files/{sample_label}_bam2bed",
+        run_time="2:00:00",
+        cores="1",
+        memory="6000",
+        job_name="bam2bed"
+    threads: 1
+    benchmark: "benchmarks/make_bed/{sample_label}_bam2bed.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        """
+        bedtools bamtobed -i {input.bam} | 
+        awk 'BEGIN {{OFS = "\t"}} $6 == "+" {{$2 = $2 + 4; $3 = $2 + 1; print}} $6 == "-" {{$3 = $3 - 4; $2 = $3 - 1; print}}' |
+        sort -k1,1 -k2,2n > {output.bed}
+        """
+
+# Call peaks based on insertion site bed coordinates
+# macs requires "reads" so first shift the single nucleotide insertion 
+# site -75 bp and then extend 150bp to create a 150bp read centered on 
+# the insertion site
+# call summits 
+rule run_MACS2_bed:
+    input:
+        bed = rules.make_insertion_bed.output.bed,
+    output:
+        narrowPeak = "output/peaks/{sample_label}_peaks.narrowPeak",
+        #broadPeak = "output/peaks/{sample_label}_peaks.broadPeak",
+        #gappedPeak = "output/peaks/{sample_label}_peaks.gappedPeak",
+        peak_xls = "output/peaks/{sample_label}_peaks.xls",
+        peak_bed = "output/peaks/{sample_label}_summits.bed",
+        peak_treat = "output/peaks/{sample_label}_treat_pileup.bdg",
+        peak_control = "output/peaks/{sample_label}_control_lambda.bdg"
+    params:
+        error_out_file = "error_files/{sample_label}_MACS2_bed",
+        run_time = "02:00:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "macs2"
+    benchmark: "benchmarks/macs2/{sample_label}.bed.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell: 
+#        "macs2 callpeak -g " + str(EFFECTIVE_GENOME_SIZE) + " --name {wildcards.sample_label} --treatment {input.bed} --outdir output/peaks --format BED --shift -75 --extsize 150 --nomodel --broad --nolambda --keep-dup all -p 0.01 -B --SPMR;"
+        "macs2 callpeak -g " + str(EFFECTIVE_GENOME_SIZE) + " --name {wildcards.sample_label} --treatment {input.bed} --outdir output/peaks --format BED --shift -75 --extsize 150 --nomodel --call-summits --nolambda --keep-dup all -B --SPMR -q 0.01; "
+
+# Peak pileup bigwigs for visualization in IGV
+# Visualize coverage of 150 bp psuedoreads centered on ATAC insert locations
+# Normalized for coverage (signal per million reads for fragment pileup profiles)
+# Generated by MACS2
+rule MACS2_bigwig:
+    input:
+        peak_treat = rules.run_MACS2_bed.output.peak_treat
+    output:
+        clipped = temp("output/coverage/{sample_label}_clipped.bdg"),
+        bigwig = "output/coverage/{sample_label}_pileup.bw"
+    params:
+        error_out_file = "error_files/{sample_label}_bigwig",
+        run_time = "02:00:00",
+        cores = "1",
+        memory = "16000",
+        job_name = "bigwig"
+    benchmark: "benchmarks/bigwig/{sample_label}.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell: 
+      "bedClip {input} " + CHROM_SIZES + " {output.clipped}; "
+      "bedGraphToBigWig {output.clipped} " + CHROM_SIZES + " {output.bigwig}"
+
+rule il2ra_insertions:
+    input:
+        insertion_beds = "output/beds/{sample_label}.insertions.bed"
+    output:
+        il2ra_beds = "output/il2ra_insertion_beds/{sample_label}_il2ra_insertions.bed"
+    params:
+        error_out_file = "error_files/{sample_label}_il2ra_reads",
+        run_time = "0:10:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "il2ra_reads"
+    benchmark: "benchmarks/counts/{sample_label}_il2ra_reads.txt"
+    shell:
+        """
+        awk '{{ if ($1 == "chr10" && $2 > 5965000 && $3 < 6100000) {{ print }} }}' {input.insertion_beds} > {output.il2ra_beds}
+        """
+
+
+rule gata3_insertions:
+    input:
+        insertion_beds = "output/beds/{sample_label}.insertions.bed"
+    output:
+        "output/regions_of_interest/gata3/{sample_label}_gata3_insertions.bed"
+    params:
+        error_out_file = "error_files/{sample_label}_gata3_reads",
+        run_time = "0:10:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "gata3_reads"
+    benchmark: "benchmarks/counts/{sample_label}_gata3_reads.txt"
+    shell:
+        """
+        awk '{{ if ($1 == "chr10" && $2 > 7993420 && $3 < 8126894) {{ print }} }}' {input.insertion_beds} > {output}
+        """
+
+rule ets1_insertions:
+    input:
+        insertion_beds = "output/beds/{sample_label}.insertions.bed"
+    output:
+        "output/regions_of_interest/ets1/{sample_label}_ets1_insertions.bed"
+    params:
+        error_out_file = "error_files/{sample_label}_ets1_reads",
+        run_time = "0:10:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "ets1_reads"
+    benchmark: "benchmarks/counts/{sample_label}_ets1_reads.txt"
+    shell:
+        """
+        awk '{{ if ($1 == "chr11" && $2 > 128406765 && $3 < 128639593) {{ print }} }}' {input.insertion_beds} > {output}
+        """
+
+rule rs1465697_insertions:
+    input:
+        insertion_beds = "output/beds/{sample_label}.insertions.bed"
+    output:
+        "output/regions_of_interest/rs1465697/{sample_label}_rs1465697_insertions.bed"
+    params:
+        error_out_file = "error_files/{sample_label}_rs1465697_reads",
+        run_time = "0:10:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "rs1465697_reads"
+    shell:
+        """
+        awk '{{ if ($1 == "chr19" && $2 > 49183989 && $3 < 49483989) {{ print }} }}' {input.insertion_beds} > {output}
+        """
+
+rule rs1323292_insertions:
+    input:
+        insertion_beds = "output/beds/{sample_label}.insertions.bed"
+    output:
+        "output/regions_of_interest/rs1323292/{sample_label}_rs1323292_insertions.bed"
+    params:
+        error_out_file = "error_files/{sample_label}_rs1323292_reads",
+        run_time = "0:10:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "rs1323292_reads"
+    shell:
+        """
+        awk '{{ if ($1 == "chr1" && $2 > 192421891 && $3 < 192721891) {{ print }} }}' {input.insertion_beds} > {output}
+        """
+
+####################################################################################################
+# Merge peaks and generate counts
+
+rule merge_peaks:
+    input:
+        peak_summit_files = expand("output/peaks/{sample_label}_summits.bed", sample_label = atac_samples),
+        peak_pileup_files = expand("output/peaks/{sample_label}_peaks.xls", sample_label = atac_samples),
+    output:
+        directory("output/merged_peaks/plots"),
+        "output/merged_peaks/plots/all_summits_gap_distance.pdf",
+        "output/merged_peaks/beds/initial_filtered_clusters.bed",
+        "output/merged_peaks/beds/IL2RA_summits.bed",
+        expand("output/merged_peaks/beds/aggregate_clusters_{size}bp.bed", size = ["50", "75", "100", "125", "150", "175", "200"]),
+        expand("output/merged_peaks/beds/aggregate_clusters_averaged_summit_{size}bp.bed", size = ["50", "75", "100", "125", "150", "175", "200"]),
+        expand("output/merged_peaks/beds/peaks_cluster_{size1}bp_peak_size_{size2}bp.bed",
+        size1 = ["50", "75", "100", "125", "150", "175", "200"],
+        size2 = ["100", "150", "200", "250", "300", "350", "400", "450", "500"]),
+        "output/merged_peaks/beds/all_peaks.RDS"
+        #best_combo_plot = "output/merged_peaks/plots/best_combo.pdf",
+        #best_combo = "output/merged_peaks/best_combo.tsv",        
+    params:
+        error_out_file = "error_files/merged_peaks",
+        run_time = "2:00:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "merged_peaks",
+        peak_summit_files = lambda wildcards, input: ','.join(input.peak_summit_files),
+        peak_pileup_files = lambda wildcards, input: ','.join(input.peak_pileup_files),
+    benchmark: "benchmarks/merged_peaks"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/merge_peaks/merge_peaks.R {params.peak_summit_files} {params.peak_pileup_files} output/merged_peaks/plots/ output/merged_peaks/beds/"
+
+rule merge_peaks_count:
+    input:
+        peaks = "output/merged_peaks/beds/all_peaks.RDS",
+        insertion_file = "output/beds/{sample_label}.insertions.bed"
+    output:
+        "output/merged_peaks/best_combo_count/{sample_label}_peaks_count.tsv"
+    params:
+        error_out_file = "error_files/merged_peaks_{sample_label}_count",
+        run_time = "0:30:00",
+        cores = "1",
+        memory = "16000",
+        job_name = "merged_peaks_count",
+    benchmark: "benchmarks/merged_peaks_{sample_label}"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/merge_peaks/best_merged_peak_counts.R {input.peaks} {input.insertion_file}"
+
+rule merge_peaks_summary:
+    input:
+        insertion_files = expand("output/merged_peaks/best_combo_count/{sample_label}_peaks_count.tsv", sample_label = atac_samples)
+    output:
+        "output/merged_peaks/plots/best_combo.pdf",
+        "output/merged_peaks/best_combo.tsv"
+    params:
+        error_out_file = "error_files/merged_peaks_summary",
+        run_time = "0:30:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "merged_peaks_summary",
+        insertion_files = lambda wildcards, input: ','.join(input.insertion_files)
+    benchmark: "benchmarks/merged_peaks_summary"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/merge_peaks/best_merged_peak_summary.R {params.insertion_files}"
+
+########################################################################################################################################
+# Analysis of results
+rule count_mat:
+    input:
+        merged_peaks = "output/merged_peaks/beds/peaks_cluster_150bp_peak_size_350bp.bed",
+        insertion_files = expand("output/beds/{sample_label}.insertions.bed", sample_label = atac_samples)
+    output:
+        counts = "output/counts/count_mat_peaks_cluster150bp_peak_size_350bp.txt"
+    params:
+        error_out_file = "error_files/counts",
+        run_time = "4:00:00",
+        cores = "1",
+        memory = "24000",
+        job_name = "sample_counts",
+        insertion_files = lambda wildcards, input: ','.join(input.insertion_files)
+    benchmark: "benchmarks/counts/counts.txt"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/make_count_mat.R {input.merged_peaks} {params.insertion_files} {output.counts}"
+
+########################################################################################################################################
+# Pool samples to generate pooled peak file and pooled coverage file
+
+# Downsample all samples to lowest read depth
+# generate peak calls with pooled reads
+rule downsample:
+    input:
+        read_stats = expand("output/qc/read_stats/{sample_label}_final_count.csv", sample_label = atac_samples),
+        bam = rules.rm_chrMXY.output.bam,
+        idx = rules.rm_chrMXY.output.idx
+    output:
+        bam = temp("output/pooled/downsampled_beds/{sample_label}.downsampled.bam"),
+        bed = "output/pooled/downsampled_beds/{sample_label}.insertions.bed"
+    params:
+        error_out_file="error_files/{sample_label}_downsample",
+        run_time="1:00:00",
+        cores="1",
+        memory="6000",
+        job_name="downsample"
+    threads: 1
+    benchmark: "benchmarks/{sample_label}_downsample.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        """
+        minReads=$(cat {input.read_stats} | awk -F ',' '/Sample/ {{next}} {{print $2}}' | sort -n | head -1);
+        finalReads=$(samtools idxstats {input.bam} | awk '{{SUM += $3}} END {{print SUM}}');
+        downsampleRatio=$(bc <<< "scale=3;$minReads/$finalReads");
+        echo $downsampleRatio;
+        samtools view -hb -s 1$downsampleRatio {input.bam} > {output.bam};
+        
+        bedtools bamtobed -i {output.bam} | 
+        awk 'BEGIN {{OFS = "\t"}} $6 == "+" {{$2 = $2 + 4; $3 = $2 + 1; print}} $6 == "-" {{$3 = $3 - 4; $2 = $3 - 1; print}}' |
+        sort -k1,1 -k2,2n > {output.bed}
+        """
+
+rule pooled_MACS2_bed:
+    input:
+        beds = expand("output/pooled/downsampled_beds/{sample_label}.insertions.bed", sample_label = atac_samples),
+    output:
+        narrowPeak = "output/pooled/peaks/pooled_peaks.narrowPeak",
+        peak_xls = "output/pooled/peaks/pooled_peaks.xls",
+        peak_bed = "output/pooled/peaks/pooled_summits.bed",
+        peak_treat = "output/pooled/peaks/pooled_treat_pileup.bdg",
+        peak_control = "output/pooled/peaks/pooled_control_lambda.bdg"
+    params:
+        error_out_file = "error_files/pooled_MACS2_bed",
+        run_time = "06:00:00",
+        cores = "1",
+        memory = "16000",
+        job_name = "macs2"
+    benchmark: "benchmarks/macs2/pooled.bed.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell: 
+        "macs2 callpeak -g " + str(EFFECTIVE_GENOME_SIZE) + " --name pooled --treatment {input.beds} --outdir output/pooled/peaks --format BED --shift -75 --extsize 150 --nomodel --call-summits --nolambda --keep-dup all -B --SPMR -q 0.01; "
+
+rule pooled_MACS2_bigwig:
+    input:
+        peak_treat = rules.pooled_MACS2_bed.output.peak_treat
+    output:
+        clipped = temp("output/pooled/coverage/pooled_clipped.bdg"),
+        bigwig = "output/pooled/coverage/pooled_pileup.bw"
+    params:
+        error_out_file = "error_files/pooled_bigwig",
+        run_time = "02:00:00",
+        cores = "1",
+        memory = "16000",
+        job_name = "bigwig"
+    benchmark: "benchmarks/bigwig/pooled.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell: 
+      "bedClip {input} " + CHROM_SIZES + " {output.clipped}; "
+      "bedGraphToBigWig {output.clipped} " + CHROM_SIZES + " {output.bigwig}"
+
+#############################################################################################################################################
+# QC 
+rule fastqc:
+    input:
+        R1 = rules.trim_adapters_cutadapt.output.R1,
+        R2 = rules.trim_adapters_cutadapt.output.R2
+    output:
+        "output/qc/fastqc/{sample_label}_R1_trimmed_fastqc.html",
+        "output/qc/fastqc/{sample_label}_R2_trimmed_fastqc.html",
+        # stuff we don't really care about but want to eliminate when run is botched
+        "output/qc/fastqc/{sample_label}_R1_trimmed_fastqc.zip",
+        "output/qc/fastqc/{sample_label}_R2_trimmed_fastqc.zip"
+    params:
+        error_out_file = "error_files/{sample_label}_fastqc",
+        run_time="01:00:00",
+        cores="1",
+        memory="16000",
+        job_name="fastqc",
+    benchmark: 
+        "benchmarks/fastqc/{sample_label}.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "fastqc {input.R1} {input.R2} --outdir=output/qc/fastqc/"
+
+rule estimate_library_complexity:
+    input:
+        bam = rules.run_bowtie.output.bam
+    output:
+        lc = "output/qc/preseq/{sample_label}.extrapolated_yield.txt"
+    params:
+        error_out_file = "error_files/{sample_label}_estimate_lc",
+        run_time = "1:00:00",
+        cores = "1",
+        memory = "8000",
+        job_name = "lc_extrap"
+    benchmark: "benchmarks/preseq/{sample_label}.txt"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "preseq lc_extrap -P -o {output.lc} -B {input.bam}" 
+
+rule picard_insert_size:
+    input:
+        bam = rules.rm_chrMXY.output.bam,
+        idx = rules.rm_chrMXY.output.idx
+    output:
+        histogram_plot = "output/qc/plots/picard_insert_size/{sample_label}_insert_size_histogram.pdf",
+        histogram_data = "output/qc/picard_insert_size/{sample_label}_insert_size_histogram.data.txt"
+    params:
+        error_out_file="error_files/{sample_label}_picard_insert_size_hist",
+        run_time="2:00:00",
+        cores="1",
+        memory="6000",
+        job_name="picard_insert_size"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "picard CollectInsertSizeMetrics I={input.bam} O={output.histogram_data} H={output.histogram_plot}" 
+
+# TSS bed file from Encode ATAC-Seq pipeline
+rule plot_tss_enrichment:
+    input:
+        insert_bed = rules.make_insertion_bed.output.bed,
+        tss_bed = "/oak/stanford/groups/pritch/users/jake/genome/human/tss/hg38_gencode_tss_unique.bed"
+    output:
+        plot = "output/qc/plots/tss/{sample_label}_tss_enrichment.pdf",
+        enrichment_file = "output/qc/tss/{sample_label}_tss_enrichment.csv",
+    params:
+        error_out_file="error_files/{sample_label}_tss",
+        run_time="1:00:00",
+        cores="1",
+        memory="24000",
+        job_name="tss"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/tss_R.R {input.tss_bed} {input.insert_bed} 2000 {wildcards.sample_label} {output.plot} {output.enrichment_file}"
+
+rule read_stats:
+    input:
+        unfiltered_bam = rules.run_bowtie.output.bam,
+        unfiltered_idx = rules.run_bowtie.output.idx,
+        filtered_bam = rules.rm_low_quality_reads.output.bam,
+        filtered_idx = rules.rm_low_quality_reads.output.idx,
+        dedup_bam = rules.rm_duplicates_picard.output.bam,
+        dedup_idx = rules.rm_duplicates_picard.output.idx,
+        final_bam = rules.rm_chrMXY.output.bam,
+        final_idx = rules.rm_chrMXY.output.idx
+    output:
+        mito = "output/qc/read_stats/{sample_label}_mito_count.csv",
+        mapped = "output/qc/read_stats/{sample_label}_mapped_count.csv",
+        final = "output/qc/read_stats/{sample_label}_final_count.csv",
+        filtered = "output/qc/read_stats/{sample_label}_filtered_count.csv",
+        duplicated = "output/qc/read_stats/{sample_label}_duplicated_count.csv"
+    params:
+        error_out_file="error_files/{sample_label}_read_stats",
+        run_time="0:20:00",
+        cores="1",
+        memory="6000",
+        job_name="read_stats"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        """
+        echo "Sample,mito_reads" > {output.mito};
+        mtReads=$(samtools idxstats {input.unfiltered_bam} | grep "chrM" | cut -f 3);
+        echo {wildcards.sample_label}","${{mtReads}} >> {output.mito};
+
+        echo "Sample,mapped_reads" > {output.mapped};
+        mappedReads=$(samtools idxstats {input.unfiltered_bam} | awk '{{SUM += $3}} END {{print SUM}}');
+        echo {wildcards.sample_label}","${{mappedReads}} >> {output.mapped};
+
+        echo "Sample,final_reads" > {output.final};
+        finalReads=$(samtools idxstats {input.final_bam} | awk '{{SUM += $3}} END {{print SUM}}');
+        echo {wildcards.sample_label}","${{finalReads}} >> {output.final};
+
+        echo "Sample,filtered_reads" > {output.filtered};
+        filteredBamReads=$(samtools idxstats {input.filtered_bam} | awk '{{SUM += $3}} END {{print SUM}}');
+        filteredReads=$(bc <<< "scale=2;$mappedReads-$filteredBamReads");
+        echo {wildcards.sample_label}","${{filteredReads}} >> {output.filtered};
+
+        echo "Sample,duplicated_reads" > {output.duplicated};
+        dedupBamReads=$(samtools idxstats {input.dedup_bam} | awk '{{SUM += $3}} END {{print SUM}}');
+        duplicatedReads=$(bc <<< "scale=2;$filteredBamReads-$dedupBamReads");
+        echo {wildcards.sample_label}","${{duplicatedReads}} >> {output.duplicated};
+        """
+
+rule plot_qc_summary:
+    input:
+        expand("output/qc/tss/{sample_label}_tss_enrichment.csv", \
+            sample_label = atac_samples),
+        expand("output/qc/read_stats/{sample_label}_{suffix}.csv", \
+            sample_label = atac_samples, \
+            suffix = ['mito_count', 'mapped_count', 'final_count', 'filtered_count', 'duplicated_count']),
+        expand("output/merged_peaks/best_combo_count/{sample_label}_peaks_count.tsv", \
+            sample_label = atac_samples)
+    output:
+        enrichment_summary_plot = "output/qc/plots/tss/enrichment_summary_mqc.png",
+        final_reads_plot = "output/qc/plots/read_stats/final_reads_mqc.png",
+        mito_percent_plot = "output/qc/plots/read_stats/mito_percent_mqc.png",
+        count_summary_plot = "output/qc/plots/read_stats/read_summary_mqc.png",
+        insert_size_summary_plot = "output/qc/plots/picard_insert_size/insert_size_summary_mqc.png",
+        percent_reads_in_peak_plot = "output/qc/plots/percent_reads_in_peak_mqc.png"
+    params:
+        error_out_file="error_files/plot_qc_summary",
+        run_time="1:00:00",
+        cores="1",
+        memory="6000",
+        job_name="qc_summary"
+    threads: 1
+    conda:
+        "envs/atac_seq.yaml"
+    envmodules:
+        "R/4.0.2"
+    shell:
+        "Rscript --vanilla scripts/tss_enrichment_summary.R output/qc/tss/ {output.enrichment_summary_plot}; "
+        "Rscript --vanilla scripts/process_read_stats.R output/qc/read_stats/ {output.final_reads_plot} "
+        "{output.mito_percent_plot} {output.count_summary_plot}; "
+        "Rscript --vanilla scripts/nucleosome_free_vs_mononucleosome.R output/qc/picard_insert_size {output.insert_size_summary_plot}; "
+        "Rscript --vanilla scripts/percent_reads_in_peaks.R output/merged_peaks/best_combo_count {output.percent_reads_in_peak_plot}" 
+
+rule multiqc:
+    input:
+        expand("output/qc/fastqc/{sample_label}_R1_trimmed_fastqc.html", \
+            sample_label = atac_samples),
+        # expand("output/qc/preseq/{sample_label}.extrapolated_yield.txt", \
+        #     sample_label = atac_samples),
+        expand("output/qc/picard_stats/picard_dedup_metrics_{sample_label}.txt", \
+            sample_label = atac_samples),
+        expand("output/qc/plots/picard_insert_size/{sample_label}_insert_size_histogram.pdf", \
+            sample_label = atac_samples),
+        rules.plot_qc_summary.output
+    output:
+        "output/multiqc/multiqc_report.html"
+    params:
+        error_out_file = "error_files/multiqc",
+        run_time="1:00:00",
+        cores="1",
+        memory="4000",
+        job_name="multiqc",
+    benchmark:
+        "benchmarks/multiqc/multiqc.txt"
+    conda:
+        "envs/atac_seq.yaml"
+    shell:
+        "multiqc -f error_files/ output/ -o output/multiqc/"

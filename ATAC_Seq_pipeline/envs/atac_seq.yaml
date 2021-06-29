@@ -1,0 +1,17 @@
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - cutadapt=2.10
+  - bowtie2=2.4.1
+  - bedtools=2.29.2
+  - samtools=1.10
+  - picard=2.23.3
+  - macs2=2.2.7.1
+  - fastqc=0.11.9
+  - preseq=2.0.3
+  - multiqc=1.9
+  - ucsc-bedclip=377
+  - ucsc-bedgraphtobigwig=377
+  - subread=2.0.1

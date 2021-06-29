@@ -1,0 +1,14 @@
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - cutadapt=2.10
+  - fastqc=0.11.9
+  - star=2.7.5b
+  - subread=2.0.1
+  - rseqc=3.0.1
+  - multiqc=1.9
+  - samtools=1.10
+  - umi_tools=1.0.1
+  - preseq=2.0.3
